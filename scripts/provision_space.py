@@ -43,6 +43,10 @@ REQUIRED = ["HF_TOKEN", "HF_USERNAME", "HF_SPACE_NAME"]
 
 DRY_RUN = os.environ.get("DRY_RUN", "").lower() in ("1", "true", "yes")
 PRIVATE_SPACE = os.environ.get("PRIVATE_SPACE", "").lower() in ("1", "true", "yes")
+# Free Hugging Face accounts cannot create private Docker Spaces. When enabled,
+# transparently retry as public so deployment still works; Space secrets remain
+# private, but the Space source/files are publicly visible.
+ALLOW_PUBLIC_FALLBACK = os.environ.get("ALLOW_PUBLIC_FALLBACK", "").lower() in ("1", "true", "yes")
 BUILD_TIMEOUT = int(os.environ.get("BUILD_TIMEOUT", "2700"))  # 45 min
 
 
@@ -76,6 +80,38 @@ def write_summary(text: str) -> None:
     if summary_path:
         with open(summary_path, "a", encoding="utf-8") as f:
             f.write(text)
+
+
+def create_space(api: HfApi, repo_id: str):
+    """Create a Docker Space, falling back to public on the free tier."""
+    global PRIVATE_SPACE
+    try:
+        return api.create_repo(
+            repo_id=repo_id,
+            repo_type="space",
+            space_sdk="docker",
+            private=PRIVATE_SPACE,
+            exist_ok=True,
+            space_hardware="cpu-basic",
+        )
+    except Exception as exc:
+        # HF returns 402 when a free account requests a private Docker Space.
+        # Only retry this specific billing/visibility case; all other failures
+        # must still fail the job instead of being hidden.
+        is_payment_error = "402" in str(exc) or "Payment Required" in str(exc)
+        if not (PRIVATE_SPACE and ALLOW_PUBLIC_FALLBACK and is_payment_error):
+            raise
+        PRIVATE_SPACE = False
+        print("::warning:: Private Docker Spaces require Hugging Face PRO; retrying as a PUBLIC Space.")
+        print("::warning:: Space secrets remain protected, but files in the Space will be public.")
+        return api.create_repo(
+            repo_id=repo_id,
+            repo_type="space",
+            space_sdk="docker",
+            private=False,
+            exist_ok=True,
+            space_hardware="cpu-basic",
+        )
 
 
 def main() -> int:
@@ -124,14 +160,7 @@ def main() -> int:
 
     # ------------------------------------------------------ create repos
     print(f"[1/5] Creating (or reusing) Space {repo_id} (sdk=docker, cpu-basic, {'private' if PRIVATE_SPACE else 'public'})…")
-    url = api.create_repo(
-        repo_id=repo_id,
-        repo_type="space",
-        space_sdk="docker",
-        private=PRIVATE_SPACE,
-        exist_ok=True,
-        space_hardware="cpu-basic",
-    )
+    url = create_space(api, repo_id)
     print(f"      -> {url}")
 
     print(f"[1/5] Creating (or reusing) private backup dataset {backup_repo}…")
